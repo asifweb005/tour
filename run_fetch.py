@@ -1,26 +1,10 @@
-import requests
-import os
-import time
-import re
+import requests, os, time, re
 from datetime import datetime
-from io import BytesIO
+from supabase import create_client
 
-try:
-    from supabase import create_client, Client
-except ImportError:
-    raise ImportError("Run: pip install supabase>=2.0.0")
-
-# ── Config ─────────────────────────────────────────────────────────────────
-
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
-
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise EnvironmentError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set.")
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# Public URL base for Supabase Storage
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 STORAGE_BASE = f"{SUPABASE_URL}/storage/v1/object/public/place-images"
 
 PLACES = [
@@ -36,218 +20,101 @@ PLACES = [
     {"id": "skardu",       "query": "Skardu Baltistan Pakistan"},
 ]
 
-WIKI_HEADERS = {
-    "User-Agent": "PakTourPlanner/1.0 (https://github.com/asifweb005/tour; contact@example.com)",
-    "Referer":    "https://en.wikipedia.org/",
-    "Accept":     "image/webp,image/jpeg,image/png,*/*",
+HEADERS = {
+    "User-Agent": "PakTourPlanner/1.0 (https://github.com/asifweb005/tour)",
+    "Referer": "https://en.wikipedia.org/",
 }
 
-# ── Upload image to Supabase Storage ──────────────────────────────────────
-
-def upload_to_storage(place_id: str, filename: str, image_bytes: bytes, content_type: str = "image/jpeg") -> str | None:
-    """Upload image bytes to Supabase Storage, return public URL."""
-    storage_path = f"{place_id}/{filename}"
-    try:
-        # Check if already exists
-        try:
-            existing = supabase.storage.from_("place-images").list(place_id)
-            names = [f["name"] for f in existing] if existing else []
-            if filename in names:
-                return f"{STORAGE_BASE}/{storage_path}"
-        except Exception:
-            pass
-
-        supabase.storage.from_("place-images").upload(
-            path=storage_path,
-            file=image_bytes,
-            file_options={"content-type": content_type, "upsert": "true"},
-        )
-        return f"{STORAGE_BASE}/{storage_path}"
-    except Exception as e:
-        print(f"      [storage] upload failed {filename}: {e}")
-        return None
-
-# ── Wikimedia Commons ──────────────────────────────────────────────────────
-
-def fetch_wikimedia_images(place_id: str, query: str, limit: int = 8) -> list[dict]:
-    url = "https://commons.wikimedia.org/w/api.php"
-    params = {
-        "action":       "query",
-        "generator":    "search",
-        "gsrnamespace": 6,
-        "gsrsearch":    f"{query} filetype:bitmap",
-        "gsrlimit":     limit,
-        "prop":         "imageinfo",
-        "iiprop":       "url|size|extmetadata|user|timestamp",
-        "iiurlwidth":   1200,
-        "format":       "json",
-    }
-    try:
-        resp = requests.get(url, params=params, headers=WIKI_HEADERS, timeout=20)
-        resp.raise_for_status()
-        pages = resp.json().get("query", {}).get("pages", {}).values()
-        images = []
-        for page in pages:
-            info = page.get("imageinfo", [{}])[0]
-            original_url = info.get("thumburl") or info.get("url", "")
-            if not original_url:
-                continue
-            width  = info.get("thumbwidth", 0)
-            height = info.get("thumbheight", 0)
-            if width < 400 or height < 300:
-                continue
-            meta = info.get("extmetadata", {})
-            license_name = meta.get("LicenseShortName", {}).get("value", "unknown")
-            if not any(x in license_name for x in ["CC", "Public domain", "PD", "cc"]):
-                continue
-
-            uploader  = info.get("user", "")
-            artist_raw = meta.get("Artist", {}).get("value", "")
-            author = re.sub(r'<[^>]+>', '', artist_raw).strip() if artist_raw else uploader
-            timestamp  = info.get("timestamp", "")
-            upload_date = timestamp[:10] if timestamp else ""
-
-            # Download the image
-            try:
-                img_resp = requests.get(original_url, headers=WIKI_HEADERS, timeout=30)
-                img_resp.raise_for_status()
-                image_bytes = img_resp.content
-                content_type = img_resp.headers.get("content-type", "image/jpeg").split(";")[0]
-            except Exception as e:
-                print(f"      [wikimedia] download failed: {e}")
-                continue
-
-            # Generate safe filename from URL
-            fname = re.sub(r'[^a-zA-Z0-9._-]', '_', original_url.split("/")[-1])[:100]
-            if not any(fname.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.webp']):
-                fname += '.jpg'
-
-            # Upload to Supabase Storage
-            public_url = upload_to_storage(place_id, fname, image_bytes, content_type)
-            if not public_url:
-                continue
-
-            images.append({
-                "url":         public_url,   # ← Supabase URL, not Wikimedia
-                "source":      "wikimedia",
-                "width":       width,
-                "height":      height,
-                "license":     license_name,
-                "author":      author[:100] if author else "",
-                "upload_date": upload_date,
-            })
-            time.sleep(0.3)  # polite to Wikimedia
-        return images
-    except Exception as e:
-        print(f"    [wikimedia] error: {e}")
-        return []
-
-# ── Pixabay ────────────────────────────────────────────────────────────────
-
-def fetch_pixabay_images(place_id: str, query: str, limit: int = 6) -> list[dict]:
-    pixabay_key = os.environ.get("PIXABAY_API_KEY", "")
-    if not pixabay_key:
-        return []
-    params = {
-        "key":         pixabay_key,
-        "q":           query,
-        "image_type":  "photo",
-        "orientation": "horizontal",
-        "category":    "travel",
-        "min_width":   800,
-        "safesearch":  "true",
-        "per_page":    limit,
-        "order":       "popular",
-    }
-    try:
-        resp = requests.get("https://pixabay.com/api/", params=params, timeout=20)
-        resp.raise_for_status()
-        hits = resp.json().get("hits", [])
-        images = []
-        for h in hits:
-            original_url = h.get("largeImageURL") or h.get("webformatURL", "")
-            if not original_url:
-                continue
-
-            # Download the image
-            try:
-                img_resp = requests.get(original_url, timeout=30)
-                img_resp.raise_for_status()
-                image_bytes = img_resp.content
-            except Exception as e:
-                print(f"      [pixabay] download failed: {e}")
-                continue
-
-            fname = f"pixabay_{h.get('id', '')}.jpg"
-            public_url = upload_to_storage(place_id, fname, image_bytes, "image/jpeg")
-            if not public_url:
-                continue
-
-            images.append({
-                "url":         public_url,
-                "source":      "pixabay",
-                "width":       h.get("imageWidth", 0),
-                "height":      h.get("imageHeight", 0),
-                "license":     "CC0",
-                "author":      h.get("user", ""),
-                "upload_date": "",
-            })
-        return images
-    except Exception as e:
-        print(f"    [pixabay] error: {e}")
-        return []
-
-# ── Supabase DB upsert ─────────────────────────────────────────────────────
-
-def upsert_images(place_id: str, images: list[dict]) -> int:
-    if not images:
-        return 0
-    rows = [
-        {
-            "place_id":    place_id,
-            "url":         img["url"],
-            "source":      img["source"],
-            "width":       img.get("width"),
-            "height":      img.get("height"),
-            "license":     img.get("license"),
-            "author":      img.get("author", ""),
-            "upload_date": img.get("upload_date", ""),
-            "fetched_at":  datetime.utcnow().isoformat(),
-        }
-        for img in images
-    ]
-    try:
-        supabase.table("place_images").upsert(rows, on_conflict="url").execute()
-        return len(rows)
-    except Exception as e:
-        print(f"    [supabase] upsert error: {e}")
-        return 0
-
-# ── Main ───────────────────────────────────────────────────────────────────
-
 def run():
-    print(f"\n{'='*60}")
-    print(f"PakTour image fetch — {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
-    print(f"Pixabay: {'enabled' if os.environ.get('PIXABAY_API_KEY') else 'disabled'}")
-    print(f"Strategy: download → upload to Supabase Storage → save URL")
-    print(f"{'='*60}\n")
-
+    print("=" * 50)
+    print(f"PakTour fetch — {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+    print("NEW SCRIPT: Downloading images to Supabase Storage")
+    print("=" * 50)
     total = 0
     for place in PLACES:
-        print(f"→ {place['id']}  ({place['query']})")
-        images = []
-        images += fetch_wikimedia_images(place["id"], place["query"], limit=8)
-        images += fetch_pixabay_images(place["id"], place["query"], limit=6)
-        count = upsert_images(place["id"], images)
-        print(f"   saved={count}  "
-              f"wiki={len([i for i in images if i['source']=='wikimedia'])}  "
-              f"pixabay={len([i for i in images if i['source']=='pixabay'])}")
-        total += count
-        time.sleep(1)
+        print(f"\n-> {place['id']}")
+        try:
+            # Step 1: Get image URLs from Wikimedia
+            params = {
+                "action": "query", "generator": "search",
+                "gsrnamespace": 6,
+                "gsrsearch": f"{place['query']} filetype:bitmap",
+                "gsrlimit": 8, "prop": "imageinfo",
+                "iiprop": "url|size|extmetadata|user|timestamp",
+                "iiurlwidth": 1200, "format": "json",
+            }
+            resp = requests.get(
+                "https://commons.wikimedia.org/w/api.php",
+                params=params, headers=HEADERS, timeout=20
+            )
+            pages = resp.json().get("query", {}).get("pages", {}).values()
+            count = 0
+            for page in pages:
+                info = page.get("imageinfo", [{}])[0]
+                orig_url = info.get("thumburl") or info.get("url", "")
+                if not orig_url:
+                    continue
+                w = info.get("thumbwidth", 0)
+                h = info.get("thumbheight", 0)
+                if w < 400 or h < 300:
+                    continue
+                meta = info.get("extmetadata", {})
+                lic = meta.get("LicenseShortName", {}).get("value", "")
+                if not any(x in lic for x in ["CC", "Public", "PD"]):
+                    continue
+                uploader = info.get("user", "")
+                ts = info.get("timestamp", "")
+                upload_date = ts[:10] if ts else ""
 
-    print(f"\n{'='*60}")
-    print(f"Done. Total: {total}")
-    print(f"{'='*60}\n")
+                # Step 2: Download the image
+                try:
+                    img = requests.get(orig_url, headers=HEADERS, timeout=30)
+                    img.raise_for_status()
+                    img_bytes = img.content
+                    ct = img.headers.get("content-type", "image/jpeg").split(";")[0]
+                except Exception as e:
+                    print(f"   download failed: {e}")
+                    continue
+
+                # Step 3: Upload to Supabase Storage
+                fname = re.sub(r'[^a-zA-Z0-9._-]', '_', orig_url.split("/")[-1])[:80]
+                if not any(fname.lower().endswith(x) for x in ['.jpg','.jpeg','.png','.webp']):
+                    fname += '.jpg'
+                storage_path = f"{place['id']}/{fname}"
+                try:
+                    supabase.storage.from_("place-images").upload(
+                        path=storage_path,
+                        file=img_bytes,
+                        file_options={"content-type": ct, "upsert": "true"},
+                    )
+                    pub_url = f"{STORAGE_BASE}/{storage_path}"
+                    print(f"   uploaded: {fname}")
+                except Exception as e:
+                    print(f"   storage failed: {e}")
+                    continue
+
+                # Step 4: Save Supabase URL to DB
+                try:
+                    supabase.table("place_images").upsert({
+                        "place_id": place["id"],
+                        "url": pub_url,
+                        "source": "wikimedia",
+                        "width": w, "height": h,
+                        "license": lic,
+                        "author": uploader[:100],
+                        "upload_date": upload_date,
+                        "fetched_at": datetime.utcnow().isoformat(),
+                    }, on_conflict="url").execute()
+                    count += 1
+                except Exception as e:
+                    print(f"   db failed: {e}")
+                time.sleep(0.3)
+            print(f"   DONE: {count} images saved to Supabase Storage")
+            total += count
+        except Exception as e:
+            print(f"   ERROR: {e}")
+        time.sleep(1)
+    print(f"\nTotal: {total} images")
 
 if __name__ == "__main__":
     run()
