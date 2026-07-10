@@ -1,4 +1,4 @@
-name: Fetch place images
+name: Fetch place images v2
 
 on:
   schedule:
