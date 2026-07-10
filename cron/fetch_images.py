@@ -3,7 +3,6 @@ import os
 import time
 from datetime import datetime
 
-# supabase-py v2 import
 try:
     from supabase import create_client, Client
 except ImportError:
@@ -16,8 +15,8 @@ SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise EnvironmentError(
-        "SUPABASE_URL and SUPABASE_SERVICE_KEY must be set as environment variables.\n"
-        "In GitHub: Settings → Secrets and variables → Actions"
+        "SUPABASE_URL and SUPABASE_SERVICE_KEY must be set.\n"
+        "GitHub: Settings → Secrets and variables → Actions"
     )
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -51,15 +50,14 @@ def fetch_wikimedia_images(query: str, limit: int = 8) -> list[dict]:
         "gsrsearch":    f"{query} filetype:bitmap",
         "gsrlimit":     limit,
         "prop":         "imageinfo",
-        "iiprop":       "url|size|extmetadata",
+        "iiprop":       "url|size|extmetadata|user|timestamp",
         "iiurlwidth":   1200,
         "format":       "json",
     }
     try:
         resp = requests.get(url, params=params, headers=HEADERS, timeout=20)
         resp.raise_for_status()
-        data = resp.json()
-        pages = data.get("query", {}).get("pages", {}).values()
+        pages = resp.json().get("query", {}).get("pages", {}).values()
         images = []
         for page in pages:
             info = page.get("imageinfo", [{}])[0]
@@ -74,59 +72,77 @@ def fetch_wikimedia_images(query: str, limit: int = 8) -> list[dict]:
             license_name = meta.get("LicenseShortName", {}).get("value", "unknown")
             if not any(x in license_name for x in ["CC", "Public domain", "PD", "cc"]):
                 continue
+
+            # Uploader info
+            uploader = info.get("user", "")
+            # Try to get real author from metadata (sometimes different from uploader)
+            artist_raw = meta.get("Artist", {}).get("value", "")
+            # Strip HTML tags from artist field
+            import re
+            author = re.sub(r'<[^>]+>', '', artist_raw).strip() if artist_raw else uploader
+
+            # Upload date
+            timestamp = info.get("timestamp", "")  # e.g. "2021-06-15T10:30:00Z"
+            upload_date = timestamp[:10] if timestamp else ""  # keep YYYY-MM-DD only
+
             images.append({
-                "url":     thumb_url,
-                "source":  "wikimedia",
-                "width":   width,
-                "height":  height,
-                "license": license_name,
+                "url":         thumb_url,
+                "source":      "wikimedia",
+                "width":       width,
+                "height":      height,
+                "license":     license_name,
+                "author":      author[:100] if author else "",
+                "upload_date": upload_date,
             })
         return images
     except Exception as e:
         print(f"    [wikimedia] error: {e}")
         return []
 
-# ── Flickr (optional) ──────────────────────────────────────────────────────
+# ── Pixabay ────────────────────────────────────────────────────────────────
 
-def fetch_flickr_images(query: str, limit: int = 5) -> list[dict]:
-    """CC-licensed photos from Flickr. Skipped if FLICKR_API_KEY not set."""
-    flickr_key = os.environ.get("FLICKR_API_KEY", "")
-    if not flickr_key:
+def fetch_pixabay_images(query: str, limit: int = 6) -> list[dict]:
+    """High-quality CC0 photos from Pixabay — free API key required."""
+    pixabay_key = os.environ.get("PIXABAY_API_KEY", "")
+    if not pixabay_key:
+        print("    [pixabay] PIXABAY_API_KEY not set, skipping")
         return []
     params = {
-        "method":         "flickr.photos.search",
-        "api_key":        flickr_key,
-        "text":           query,
-        "license":        "1,2,4,5,6,9,10",
-        "sort":           "relevance",
-        "content_type":   1,
-        "media":          "photos",
-        "extras":         "url_l,url_c,license",
-        "per_page":       limit,
-        "format":         "json",
-        "nojsoncallback": 1,
+        "key":          pixabay_key,
+        "q":            query,
+        "image_type":   "photo",
+        "orientation":  "horizontal",
+        "category":     "travel",
+        "min_width":    800,
+        "safesearch":   "true",
+        "per_page":     limit,
+        "order":        "popular",
     }
     try:
         resp = requests.get(
-            "https://api.flickr.com/services/rest/",
-            params=params, timeout=20,
+            "https://pixabay.com/api/",
+            params=params,
+            timeout=20,
         )
         resp.raise_for_status()
-        photos = resp.json().get("photos", {}).get("photo", [])
+        hits = resp.json().get("hits", [])
         images = []
-        for p in photos:
-            img_url = p.get("url_l") or p.get("url_c", "")
-            if img_url:
-                images.append({
-                    "url":     img_url,
-                    "source":  "flickr",
-                    "width":   int(p.get("width_l", 0)),
-                    "height":  int(p.get("height_l", 0)),
-                    "license": f"CC-{p.get('license', '')}",
-                })
+        for h in hits:
+            img_url = h.get("largeImageURL") or h.get("webformatURL", "")
+            if not img_url:
+                continue
+            images.append({
+                "url":         img_url,
+                "source":      "pixabay",
+                "width":       h.get("imageWidth", 0),
+                "height":      h.get("imageHeight", 0),
+                "license":     "CC0",
+                "author":      h.get("user", ""),
+                "upload_date": "",   # Pixabay doesn't return upload date in free API
+            })
         return images
     except Exception as e:
-        print(f"    [flickr] error: {e}")
+        print(f"    [pixabay] error: {e}")
         return []
 
 # ── Supabase upsert ────────────────────────────────────────────────────────
@@ -137,13 +153,15 @@ def upsert_images(place_id: str, images: list[dict]) -> int:
         return 0
     rows = [
         {
-            "place_id":   place_id,
-            "url":        img["url"],
-            "source":     img["source"],
-            "width":      img.get("width"),
-            "height":     img.get("height"),
-            "license":    img.get("license"),
-            "fetched_at": datetime.utcnow().isoformat(),
+            "place_id":    place_id,
+            "url":         img["url"],
+            "source":      img["source"],
+            "width":       img.get("width"),
+            "height":      img.get("height"),
+            "license":     img.get("license"),
+            "author":      img.get("author", ""),
+            "upload_date": img.get("upload_date", ""),
+            "fetched_at":  datetime.utcnow().isoformat(),
         }
         for img in images
     ]
@@ -160,6 +178,7 @@ def run():
     print(f"\n{'='*60}")
     print(f"PakTour image fetch — {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"Supabase: {SUPABASE_URL}")
+    print(f"Pixabay: {'enabled' if os.environ.get('PIXABAY_API_KEY') else 'disabled (key not set)'}")
     print(f"{'='*60}\n")
 
     total = 0
@@ -167,11 +186,13 @@ def run():
         print(f"→ {place['id']}  ({place['query']})")
         images = []
         images += fetch_wikimedia_images(place["query"], limit=8)
-        images += fetch_flickr_images(place["query"], limit=5)
+        images += fetch_pixabay_images(place["query"], limit=6)
         count = upsert_images(place["id"], images)
-        print(f"   fetched={len(images)}  saved={count}")
+        print(f"   wikimedia={len([i for i in images if i['source']=='wikimedia'])}  "
+              f"pixabay={len([i for i in images if i['source']=='pixabay'])}  "
+              f"saved={count}")
         total += count
-        time.sleep(1)   # be polite to APIs
+        time.sleep(1)
 
     print(f"\n{'='*60}")
     print(f"Done. Total rows upserted: {total}")
