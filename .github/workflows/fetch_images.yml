@@ -1,0 +1,31 @@
+name: Fetch place images
+
+on:
+  schedule:
+    # Every Sunday at 9pm UTC = Monday 2am PKT
+    - cron: '0 21 * * 0'
+  # Also lets you click "Run workflow" manually from GitHub Actions tab
+  workflow_dispatch:
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r cron/requirements.txt
+
+      - name: Run image fetcher
+        run: python cron/fetch_images.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          FLICKR_API_KEY: ${{ secrets.FLICKR_API_KEY }}
