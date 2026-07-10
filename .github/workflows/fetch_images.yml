@@ -2,9 +2,7 @@ name: Fetch place images
 
 on:
   schedule:
-    # Every Sunday at 9pm UTC = Monday 2am PKT
     - cron: '0 21 * * 0'
-  # Also lets you click "Run workflow" manually from GitHub Actions tab
   workflow_dispatch:
 
 jobs:
@@ -22,6 +20,16 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r cron/requirements.txt
+
+      - name: Verify env vars are set
+        run: |
+          if [ -z "$SUPABASE_URL" ]; then echo "ERROR: SUPABASE_URL is not set"; exit 1; fi
+          if [ -z "$SUPABASE_SERVICE_KEY" ]; then echo "ERROR: SUPABASE_SERVICE_KEY is not set"; exit 1; fi
+          echo "SUPABASE_URL is set: $SUPABASE_URL"
+          echo "SUPABASE_SERVICE_KEY is set: (hidden)"
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
       - name: Run image fetcher
         run: python cron/fetch_images.py
