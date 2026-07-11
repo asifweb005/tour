@@ -1,0 +1,76 @@
+name: PakTour Save URLs
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 21 * * 0'
+
+jobs:
+  save:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests supabase
+      - name: Save Wikimedia URLs to DB
+        run: |
+          python - << 'PYEOF'
+          import requests, os, time
+          from datetime import datetime
+          from supabase import create_client
+          SUPABASE_URL = os.environ['SUPABASE_URL']
+          SUPABASE_KEY = os.environ['SUPABASE_SERVICE_KEY']
+          supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+          PLACES = [
+            {'id':'islamabad','query':'Islamabad Pakistan city'},
+            {'id':'murree','query':'Murree hill station Pakistan'},
+            {'id':'nathiagali','query':'Nathia Gali Pakistan'},
+            {'id':'kaghan','query':'Kaghan Valley Pakistan'},
+            {'id':'swat','query':'Swat Valley Pakistan'},
+            {'id':'chitral','query':'Chitral Pakistan'},
+            {'id':'fairymeadows','query':'Fairy Meadows Nanga Parbat'},
+            {'id':'gilgit','query':'Gilgit Pakistan'},
+            {'id':'hunza','query':'Hunza Valley Pakistan'},
+            {'id':'skardu','query':'Skardu Pakistan'},
+          ]
+          H = {'User-Agent':'PakTourPlanner/1.0 (asifweb005)'}
+          total = 0
+          for p in PLACES:
+            print(f"-> {p['id']}")
+            try:
+              r = requests.get('https://commons.wikimedia.org/w/api.php', headers=H, timeout=20, params={
+                'action':'query','generator':'search','gsrnamespace':6,
+                'gsrsearch':f"{p['query']} filetype:bitmap",'gsrlimit':8,
+                'prop':'imageinfo','iiprop':'url|size|extmetadata|user|timestamp',
+                'iiurlwidth':1200,'format':'json'})
+              r.raise_for_status()
+              pages = r.json().get('query',{}).get('pages',{}).values()
+              rows = []
+              for pg in pages:
+                info = pg.get('imageinfo',[{}])[0]
+                url = info.get('thumburl') or info.get('url','')
+                if not url: continue
+                w,h = info.get('thumbwidth',0),info.get('thumbheight',0)
+                if w<400 or h<300: continue
+                meta = info.get('extmetadata',{})
+                lic = meta.get('LicenseShortName',{}).get('value','')
+                if not any(x in lic for x in ['CC','Public','PD']): continue
+                rows.append({'place_id':p['id'],'url':url,'source':'wikimedia',
+                  'width':w,'height':h,'license':lic,
+                  'author':info.get('user','')[:100],
+                  'upload_date':(info.get('timestamp','') or '')[:10],
+                  'fetched_at':datetime.utcnow().isoformat()})
+              if rows:
+                supabase.table('place_images').upsert(rows,on_conflict='url').execute()
+              print(f'   saved {len(rows)} URLs')
+              total += len(rows)
+            except Exception as e:
+              print(f'   error: {e}')
+            time.sleep(3)
+          print(f'Done. Total: {total}')
+          PYEOF
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
